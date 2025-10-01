@@ -1,0 +1,50 @@
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# PowerShell
+*.ps1xml
+*.psd1
+*.psm1
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# Log files
+*.log
+*.txt
+
+# Downloaded installers (temporary)
+vcredist_*.exe
+VC_redist.*.exe
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# JetBrains IDEs
+.idea/
+*.iml
+
+# System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows shortcuts
+*.lnk
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Test files
+test_*.ps1
+*_test.ps1
