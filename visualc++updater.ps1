@@ -22,7 +22,7 @@
     
     Version Checking:
     - EOL versions (2005, 2008, 2010, 2012, 2013): Compares against final known versions
-    - Non-EOL versions (2015-2022): Only downloads if current version is older than recent threshold
+    - Non-EOL versions (2015-2022): Downloads latest and installs only if newer than installed version
     - Automatically detects if downloaded installer is newer than installed version
     - Skips installation if current version is already up to date
     - Avoids unnecessary downloads when versions are already current or recent enough
@@ -35,7 +35,7 @@
     - 2013: 12.0.40649.5 (Latest) - Final
     
     Automatically Detected Versions (Non-EOL):
-    - 2015-2022: Downloads and checks latest if current version < 14.40.0.0
+    - 2015-2022: Downloads latest and installs if newer than current
 #>
 
 #Requires -RunAsAdministrator
@@ -55,11 +55,13 @@ $VCVersions = @{
         KB = "KB2538242"
         TargetVersion = "8.0.50727.6195"
         IsEOL = $true
-        URLs = @{
-            x86 = "https://www.microsoft.com/en-us/download/details.aspx?id=26347"
-            x64 = "https://www.microsoft.com/en-us/download/details.aspx?id=26347"
+        URLs = @{}
+        ConfirmationPage = "https://www.microsoft.com/download/confirmation.aspx?id=26347"
+        DownloadPage = "https://www.microsoft.com/download/details.aspx?id=26347"
+        DownloadFileNames = @{
+            x86 = "vcredist_x86.exe"
+            x64 = "vcredist_x64.exe"
         }
-        Note = "Download page only - direct URLs not available"
     }
     "2008" = @{
         DisplayName = "Microsoft Visual C\+\+ 2008.*Redistributable"
@@ -105,11 +107,11 @@ $VCVersions = @{
         DisplayName = "Microsoft Visual C\+\+ 201[5-9]|Microsoft Visual C\+\+ 202[0-9]"
         KB = "Latest"
         TargetVersion = $null
-        MinRecentVersion = "14.40.0.0"  # Skip download if version is newer than this
         IsEOL = $false
         URLs = @{
             x86 = "https://aka.ms/vs/17/release/vc_redist.x86.exe"
             x64 = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+            arm64 = "https://aka.ms/vs/17/release/vc_redist.arm64.exe"
         }
     }
 }
@@ -120,7 +122,7 @@ function Test-VCInstalled {
         [Parameter(Mandatory=$true)]
         [string]$DisplayNamePattern,
         [Parameter(Mandatory=$true)]
-        [ValidateSet('x86', 'x64')]
+        [ValidateSet('x86', 'x64', 'arm64')]
         [string]$Architecture
     )
     
@@ -277,6 +279,113 @@ function Get-InstallerVersion {
     return $null
 }
 
+# Function to resolve direct download URLs from a Microsoft confirmation page
+function Resolve-DownloadUrl {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$ConfirmationPage,
+        [Parameter(Mandatory=$true)]
+        [string]$FileName
+    )
+    
+    try {
+        $headers = @{ 'User-Agent' = 'Mozilla/5.0' }
+        $response = Invoke-WebRequest -Uri $ConfirmationPage -UseBasicParsing -Headers $headers -ErrorAction Stop
+        $escapedFileName = [regex]::Escape($FileName)
+        $pattern = "https://download\.microsoft\.com/[^`"']+$escapedFileName"
+        $match = [regex]::Match($response.Content, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        
+        if ($match.Success) {
+            return $match.Value
+        }
+    }
+    catch {
+        Write-Host "  DEBUG: Could not resolve download URL from confirmation page: $_" -ForegroundColor DarkGray
+    }
+    
+    return $null
+}
+
+# Function to load cached metadata for latest 2015-2022 installers
+function Get-RedistCachePath {
+    $cacheDir = Join-Path $env:ProgramData "VisualCppUpdater"
+    return Join-Path $cacheDir "vc_redist_cache.json"
+}
+
+function ConvertTo-Hashtable {
+    param([object]$InputObject)
+    
+    if ($null -eq $InputObject) {
+        return @{}
+    }
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        return $InputObject
+    }
+    
+    $hash = @{}
+    foreach ($property in $InputObject.PSObject.Properties) {
+        $value = $property.Value
+        if ($value -is [pscustomobject]) {
+            $value = ConvertTo-Hashtable -InputObject $value
+        }
+        $hash[$property.Name] = $value
+    }
+    
+    return $hash
+}
+
+function Load-RedistCache {
+    $cachePath = Get-RedistCachePath
+    if (Test-Path $cachePath) {
+        try {
+            $json = Get-Content -Path $cachePath -Raw -ErrorAction Stop
+            if (-not [string]::IsNullOrWhiteSpace($json)) {
+                $obj = $json | ConvertFrom-Json
+                return ConvertTo-Hashtable -InputObject $obj
+            }
+        }
+        catch {
+            Write-Host "  DEBUG: Could not read cache: $_" -ForegroundColor DarkGray
+        }
+    }
+    
+    return @{}
+}
+
+function Save-RedistCache {
+    param([hashtable]$Cache)
+    
+    $cachePath = Get-RedistCachePath
+    try {
+        $cacheDir = Split-Path $cachePath -Parent
+        if (-not (Test-Path $cacheDir)) {
+            New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+        }
+        $Cache | ConvertTo-Json -Depth 5 | Set-Content -Path $cachePath -Encoding ASCII
+    }
+    catch {
+        Write-Host "  DEBUG: Could not write cache: $_" -ForegroundColor DarkGray
+    }
+}
+
+function Get-RemoteFileMetadata {
+    param([Parameter(Mandatory=$true)][string]$Url)
+    
+    try {
+        $headers = @{ 'User-Agent' = 'Mozilla/5.0' }
+        $response = Invoke-WebRequest -Uri $Url -Method Head -UseBasicParsing -Headers $headers -ErrorAction Stop
+        return @{
+            ETag = $response.Headers.ETag
+            LastModified = $response.Headers.'Last-Modified'
+        }
+    }
+    catch {
+        Write-Host "  DEBUG: Could not query remote metadata: $_" -ForegroundColor DarkGray
+    }
+    
+    return $null
+}
+
 # Scan for installed versions
 Write-Host "Scanning for installed Visual C++ redistributables..." -ForegroundColor Yellow
 Write-Host ""
@@ -291,17 +400,21 @@ foreach ($version in $VCVersions.Keys | Sort-Object) {
     
     $x86Installed = Test-VCInstalled -DisplayNamePattern $vcInfo.DisplayName -Architecture "x86"
     $x64Installed = Test-VCInstalled -DisplayNamePattern $vcInfo.DisplayName -Architecture "x64"
+    $arm64Installed = Test-VCInstalled -DisplayNamePattern $vcInfo.DisplayName -Architecture "arm64"
     
-    if ($x86Installed.Installed -or $x64Installed.Installed) {
+    if ($x86Installed.Installed -or $x64Installed.Installed -or $arm64Installed.Installed) {
         $installedVersions[$version] = @{
             x86 = $x86Installed.Installed
             x64 = $x64Installed.Installed
+            arm64 = $arm64Installed.Installed
             x86Details = $x86Installed.Details
             x64Details = $x64Installed.Details
+            arm64Details = $arm64Installed.Details
         }
         
         if ($x86Installed.Installed) { $updateCount++ }
         if ($x64Installed.Installed) { $updateCount++ }
+        if ($arm64Installed.Installed) { $updateCount++ }
     }
 }
 
@@ -364,6 +477,26 @@ foreach ($version in $installedVersions.Keys | Sort-Object) {
             }
         }
     }
+    
+    if ($installed.arm64) {
+        Write-Host "  [arm64] INSTALLED" -ForegroundColor Green
+        if ($installed.arm64Details.DisplayVersion) {
+            Write-Host "        Current Version: $($installed.arm64Details.DisplayVersion)" -ForegroundColor Gray
+            
+            if ($vcInfo.IsEOL) {
+                if ($vcInfo.TargetVersion -and (Compare-Version -CurrentVersion $installed.arm64Details.DisplayVersion -TargetVersion $vcInfo.TargetVersion)) {
+                    Write-Host "        Status: UP TO DATE (will skip)" -ForegroundColor Cyan
+                }
+                else {
+                    Write-Host "        Target Version: $($vcInfo.TargetVersion)" -ForegroundColor Gray
+                    Write-Host "        Status: UPDATE AVAILABLE" -ForegroundColor Yellow
+                }
+            }
+            else {
+                Write-Host "        Status: Will check latest version dynamically" -ForegroundColor Yellow
+            }
+        }
+    }
 }
 
 Write-Host ""
@@ -378,6 +511,7 @@ Write-Host ""
 $TempDir = $env:TEMP
 $RebootRequired = $false
 $downloadedFiles = @()
+$redistCache = Load-RedistCache
 
 # Silent installation arguments by version
 $SilentArgsMap = @{
@@ -403,8 +537,10 @@ try {
         if ($installed.x86) {
             $currentUpdate++
             
+            $currentVersion = $installed.x86Details.DisplayVersion
+            do {
+            
             if ($vcInfo.IsEOL) {
-                $currentVersion = $installed.x86Details.DisplayVersion
                 $targetVersion = $vcInfo.TargetVersion
                 
                 Write-Host "  DEBUG: Current x86 version: '$currentVersion'" -ForegroundColor DarkGray
@@ -418,8 +554,7 @@ try {
                     
                     if ($kbInstalled) {
                         Write-Host "[$currentUpdate/$updateCount] x86 $kbNumber already installed - Skipping" -ForegroundColor Cyan
-                        Write-Host ""
-                        continue
+                        break
                     }
                 }
                 
@@ -430,19 +565,8 @@ try {
                     
                     if ($isUpToDate) {
                         Write-Host "[$currentUpdate/$updateCount] x86 version already up to date ($currentVersion) - Skipping" -ForegroundColor Cyan
-                        Write-Host ""
-                        continue
+                        break
                     }
-                }
-            }
-            
-            # For non-EOL versions, check if current version is recent enough to skip download
-            if (-not $vcInfo.IsEOL -and $vcInfo.MinRecentVersion) {
-                $currentVersion = $installed.x86Details.DisplayVersion
-                if ($currentVersion -and (Compare-Version -CurrentVersion $currentVersion -TargetVersion $vcInfo.MinRecentVersion)) {
-                    Write-Host "[$currentUpdate/$updateCount] x86 version ($currentVersion) is recent enough - Skipping download and installation" -ForegroundColor Cyan
-                    Write-Host ""
-                    continue
                 }
             }
             
@@ -450,9 +574,59 @@ try {
             
             $url = $vcInfo.URLs.x86
             
-            if ($vcInfo.Note -eq "Download page only - direct URLs not available") {
+            if ($vcInfo.ConfirmationPage -and $vcInfo.DownloadFileNames.x86) {
+                $resolvedUrl = Resolve-DownloadUrl -ConfirmationPage $vcInfo.ConfirmationPage -FileName $vcInfo.DownloadFileNames.x86
+                if ($resolvedUrl) {
+                    $url = $resolvedUrl
+                }
+            }
+            
+            if (-not $vcInfo.IsEOL -and $url) {
+                $remoteMeta = Get-RemoteFileMetadata -Url $url
+                $cacheEntry = $null
+                
+                if ($redistCache.ContainsKey($version) -and ($redistCache[$version] -is [hashtable]) -and $redistCache[$version].ContainsKey("x86")) {
+                    $cacheEntry = $redistCache[$version]["x86"]
+                }
+                
+                if ($remoteMeta -and $cacheEntry) {
+                    $updated = $false
+                    if (-not $cacheEntry.ETag -and $remoteMeta.ETag) {
+                        $cacheEntry.ETag = $remoteMeta.ETag
+                        $updated = $true
+                    }
+                    if (-not $cacheEntry.LastModified -and $remoteMeta.LastModified) {
+                        $cacheEntry.LastModified = $remoteMeta.LastModified
+                        $updated = $true
+                    }
+                    if ($updated) {
+                        $redistCache[$version]["x86"] = $cacheEntry
+                        Save-RedistCache -Cache $redistCache
+                    }
+                }
+                
+                $metaMatches = $false
+                if ($remoteMeta -and $cacheEntry) {
+                    if ($remoteMeta.ETag -and $cacheEntry.ETag -and ($cacheEntry.ETag -eq $remoteMeta.ETag)) {
+                        $metaMatches = $true
+                    }
+                    elseif ($remoteMeta.LastModified -and $cacheEntry.LastModified -and ($cacheEntry.LastModified -eq $remoteMeta.LastModified)) {
+                        $metaMatches = $true
+                    }
+                }
+                
+                if ($metaMatches -and $cacheEntry.InstallerVersion -and $currentVersion -and
+                    (Compare-Version -CurrentVersion $currentVersion -TargetVersion $cacheEntry.InstallerVersion)) {
+                    Write-Host "[$currentUpdate/$updateCount] x86 latest installer unchanged and current version ($currentVersion) >= cached ($($cacheEntry.InstallerVersion)) - Skipping download" -ForegroundColor Cyan
+                    break
+                }
+            }
+            
+            if (-not $url) {
                 Write-Host "  NOTE: Visual C++ $version requires manual download" -ForegroundColor Yellow
-                Write-Host "  Please visit: $url" -ForegroundColor Yellow
+                if ($vcInfo.DownloadPage) {
+                    Write-Host "  Please visit: $($vcInfo.DownloadPage)" -ForegroundColor Yellow
+                }
                 Write-Host "  Skipping automated update for this version." -ForegroundColor Yellow
             }
             else {
@@ -461,21 +635,41 @@ try {
                 
                 try {
                     Write-Host "  Downloading..."
-                    Invoke-WebRequest -Uri $url -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
+                    $downloadResponse = Invoke-WebRequest -Uri $url -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
                     Write-Host "  Download complete." -ForegroundColor Green
                     
                     if (Test-Path $installerPath) {
                         # Check installer version for both EOL and non-EOL versions
                         $installerVersion = Get-InstallerVersion -FilePath $installerPath
-                        $currentVersion = $installed.x86Details.DisplayVersion
+                        $etag = $null
+                        $lastModified = $null
+                        if ($remoteMeta) {
+                            $etag = $remoteMeta.ETag
+                            $lastModified = $remoteMeta.LastModified
+                        }
+                        elseif ($downloadResponse -and $downloadResponse.Headers) {
+                            $etag = $downloadResponse.Headers.ETag
+                            $lastModified = $downloadResponse.Headers.'Last-Modified'
+                        }
+                        
+                        if (-not $vcInfo.IsEOL) {
+                            if (-not $redistCache.ContainsKey($version)) {
+                                $redistCache[$version] = @{}
+                            }
+                            $redistCache[$version]["x86"] = @{
+                                ETag = $etag
+                                LastModified = $lastModified
+                                InstallerVersion = $installerVersion
+                            }
+                            Save-RedistCache -Cache $redistCache
+                        }
                         
                         if ($installerVersion) {
                             Write-Host "  Downloaded installer version: $installerVersion" -ForegroundColor Gray
                             
                             if ($currentVersion -and (Compare-Version -CurrentVersion $currentVersion -TargetVersion $installerVersion)) {
                                 Write-Host "  Current version ($currentVersion) is already same or newer than installer ($installerVersion) - Skipping installation" -ForegroundColor Cyan
-                                Write-Host ""
-                                continue
+                                break
                             }
                         }
                         
@@ -523,8 +717,10 @@ try {
         if ($installed.x64) {
             $currentUpdate++
             
+            $currentVersion = $installed.x64Details.DisplayVersion
+            do {
+            
             if ($vcInfo.IsEOL) {
-                $currentVersion = $installed.x64Details.DisplayVersion
                 $targetVersion = $vcInfo.TargetVersion
                 
                 Write-Host "  DEBUG: Current x64 version: '$currentVersion'" -ForegroundColor DarkGray
@@ -538,8 +734,7 @@ try {
                     
                     if ($kbInstalled) {
                         Write-Host "[$currentUpdate/$updateCount] x64 $kbNumber already installed - Skipping" -ForegroundColor Cyan
-                        Write-Host ""
-                        continue
+                        break
                     }
                 }
                 
@@ -550,19 +745,8 @@ try {
                     
                     if ($isUpToDate) {
                         Write-Host "[$currentUpdate/$updateCount] x64 version already up to date ($currentVersion) - Skipping" -ForegroundColor Cyan
-                        Write-Host ""
-                        continue
+                        break
                     }
-                }
-            }
-            
-            # For non-EOL versions, check if current version is recent enough to skip download
-            if (-not $vcInfo.IsEOL -and $vcInfo.MinRecentVersion) {
-                $currentVersion = $installed.x64Details.DisplayVersion
-                if ($currentVersion -and (Compare-Version -CurrentVersion $currentVersion -TargetVersion $vcInfo.MinRecentVersion)) {
-                    Write-Host "[$currentUpdate/$updateCount] x64 version ($currentVersion) is recent enough - Skipping download and installation" -ForegroundColor Cyan
-                    Write-Host ""
-                    continue
                 }
             }
             
@@ -570,9 +754,59 @@ try {
             
             $url = $vcInfo.URLs.x64
             
-            if ($vcInfo.Note -eq "Download page only - direct URLs not available") {
+            if ($vcInfo.ConfirmationPage -and $vcInfo.DownloadFileNames.x64) {
+                $resolvedUrl = Resolve-DownloadUrl -ConfirmationPage $vcInfo.ConfirmationPage -FileName $vcInfo.DownloadFileNames.x64
+                if ($resolvedUrl) {
+                    $url = $resolvedUrl
+                }
+            }
+            
+            if (-not $vcInfo.IsEOL -and $url) {
+                $remoteMeta = Get-RemoteFileMetadata -Url $url
+                $cacheEntry = $null
+                
+                if ($redistCache.ContainsKey($version) -and ($redistCache[$version] -is [hashtable]) -and $redistCache[$version].ContainsKey("x64")) {
+                    $cacheEntry = $redistCache[$version]["x64"]
+                }
+                
+                if ($remoteMeta -and $cacheEntry) {
+                    $updated = $false
+                    if (-not $cacheEntry.ETag -and $remoteMeta.ETag) {
+                        $cacheEntry.ETag = $remoteMeta.ETag
+                        $updated = $true
+                    }
+                    if (-not $cacheEntry.LastModified -and $remoteMeta.LastModified) {
+                        $cacheEntry.LastModified = $remoteMeta.LastModified
+                        $updated = $true
+                    }
+                    if ($updated) {
+                        $redistCache[$version]["x64"] = $cacheEntry
+                        Save-RedistCache -Cache $redistCache
+                    }
+                }
+                
+                $metaMatches = $false
+                if ($remoteMeta -and $cacheEntry) {
+                    if ($remoteMeta.ETag -and $cacheEntry.ETag -and ($cacheEntry.ETag -eq $remoteMeta.ETag)) {
+                        $metaMatches = $true
+                    }
+                    elseif ($remoteMeta.LastModified -and $cacheEntry.LastModified -and ($cacheEntry.LastModified -eq $remoteMeta.LastModified)) {
+                        $metaMatches = $true
+                    }
+                }
+                
+                if ($metaMatches -and $cacheEntry.InstallerVersion -and $currentVersion -and
+                    (Compare-Version -CurrentVersion $currentVersion -TargetVersion $cacheEntry.InstallerVersion)) {
+                    Write-Host "[$currentUpdate/$updateCount] x64 latest installer unchanged and current version ($currentVersion) >= cached ($($cacheEntry.InstallerVersion)) - Skipping download" -ForegroundColor Cyan
+                    break
+                }
+            }
+            
+            if (-not $url) {
                 Write-Host "  NOTE: Visual C++ $version requires manual download" -ForegroundColor Yellow
-                Write-Host "  Please visit: $url" -ForegroundColor Yellow
+                if ($vcInfo.DownloadPage) {
+                    Write-Host "  Please visit: $($vcInfo.DownloadPage)" -ForegroundColor Yellow
+                }
                 Write-Host "  Skipping automated update for this version." -ForegroundColor Yellow
             }
             else {
@@ -581,21 +815,41 @@ try {
                 
                 try {
                     Write-Host "  Downloading..."
-                    Invoke-WebRequest -Uri $url -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
+                    $downloadResponse = Invoke-WebRequest -Uri $url -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
                     Write-Host "  Download complete." -ForegroundColor Green
                     
                     if (Test-Path $installerPath) {
                         # Check installer version for both EOL and non-EOL versions
                         $installerVersion = Get-InstallerVersion -FilePath $installerPath
-                        $currentVersion = $installed.x64Details.DisplayVersion
+                        $etag = $null
+                        $lastModified = $null
+                        if ($remoteMeta) {
+                            $etag = $remoteMeta.ETag
+                            $lastModified = $remoteMeta.LastModified
+                        }
+                        elseif ($downloadResponse -and $downloadResponse.Headers) {
+                            $etag = $downloadResponse.Headers.ETag
+                            $lastModified = $downloadResponse.Headers.'Last-Modified'
+                        }
+                        
+                        if (-not $vcInfo.IsEOL) {
+                            if (-not $redistCache.ContainsKey($version)) {
+                                $redistCache[$version] = @{}
+                            }
+                            $redistCache[$version]["x64"] = @{
+                                ETag = $etag
+                                LastModified = $lastModified
+                                InstallerVersion = $installerVersion
+                            }
+                            Save-RedistCache -Cache $redistCache
+                        }
                         
                         if ($installerVersion) {
                             Write-Host "  Downloaded installer version: $installerVersion" -ForegroundColor Gray
                             
                             if ($currentVersion -and (Compare-Version -CurrentVersion $currentVersion -TargetVersion $installerVersion)) {
                                 Write-Host "  Current version ($currentVersion) is already same or newer than installer ($installerVersion) - Skipping installation" -ForegroundColor Cyan
-                                Write-Host ""
-                                continue
+                                break
                             }
                         }
                         
@@ -636,6 +890,191 @@ try {
                     Write-Warning "  Failed: $_"
                 }
             }
+            } while ($false)
+            Write-Host ""
+        }
+
+        # Update arm64 if installed
+        if ($installed.arm64) {
+            $currentUpdate++
+            
+            $currentVersion = $installed.arm64Details.DisplayVersion
+            do {
+            
+            if ($vcInfo.IsEOL) {
+                $targetVersion = $vcInfo.TargetVersion
+                
+                Write-Host "  DEBUG: Current arm64 version: '$currentVersion'" -ForegroundColor DarkGray
+                Write-Host "  DEBUG: Target version: '$targetVersion'" -ForegroundColor DarkGray
+                
+                # For versions with KB numbers, check if KB is already installed
+                if ($vcInfo.KB -match "KB\d+") {
+                    $kbNumber = $vcInfo.KB
+                    $kbInstalled = Test-KBInstalled -KBNumber $kbNumber
+                    Write-Host "  DEBUG: Checking for $kbNumber installed: $kbInstalled" -ForegroundColor DarkGray
+                    
+                    if ($kbInstalled) {
+                        Write-Host "[$currentUpdate/$updateCount] arm64 $kbNumber already installed - Skipping" -ForegroundColor Cyan
+                        break
+                    }
+                }
+                
+                # Also check version number
+                if ($targetVersion -and $currentVersion) {
+                    $isUpToDate = Compare-Version -CurrentVersion $currentVersion -TargetVersion $targetVersion
+                    Write-Host "  DEBUG: Up to date check result: $isUpToDate" -ForegroundColor DarkGray
+                    
+                    if ($isUpToDate) {
+                        Write-Host "[$currentUpdate/$updateCount] arm64 version already up to date ($currentVersion) - Skipping" -ForegroundColor Cyan
+                        break
+                    }
+                }
+            }
+            
+            Write-Host "[$currentUpdate/$updateCount] Processing arm64 version..." -ForegroundColor Cyan
+            
+            $url = $null
+            if ($vcInfo.URLs.ContainsKey("arm64")) {
+                $url = $vcInfo.URLs.arm64
+            }
+            
+            if ($vcInfo.ConfirmationPage -and $vcInfo.DownloadFileNames.arm64) {
+                $resolvedUrl = Resolve-DownloadUrl -ConfirmationPage $vcInfo.ConfirmationPage -FileName $vcInfo.DownloadFileNames.arm64
+                if ($resolvedUrl) {
+                    $url = $resolvedUrl
+                }
+            }
+            
+            if (-not $vcInfo.IsEOL -and $url) {
+                $remoteMeta = Get-RemoteFileMetadata -Url $url
+                $cacheEntry = $null
+                
+                if ($redistCache.ContainsKey($version) -and ($redistCache[$version] -is [hashtable]) -and $redistCache[$version].ContainsKey("arm64")) {
+                    $cacheEntry = $redistCache[$version]["arm64"]
+                }
+                
+                if ($remoteMeta -and $cacheEntry) {
+                    $updated = $false
+                    if (-not $cacheEntry.ETag -and $remoteMeta.ETag) {
+                        $cacheEntry.ETag = $remoteMeta.ETag
+                        $updated = $true
+                    }
+                    if (-not $cacheEntry.LastModified -and $remoteMeta.LastModified) {
+                        $cacheEntry.LastModified = $remoteMeta.LastModified
+                        $updated = $true
+                    }
+                    if ($updated) {
+                        $redistCache[$version]["arm64"] = $cacheEntry
+                        Save-RedistCache -Cache $redistCache
+                    }
+                }
+                
+                $metaMatches = $false
+                if ($remoteMeta -and $cacheEntry) {
+                    if ($remoteMeta.ETag -and $cacheEntry.ETag -and ($cacheEntry.ETag -eq $remoteMeta.ETag)) {
+                        $metaMatches = $true
+                    }
+                    elseif ($remoteMeta.LastModified -and $cacheEntry.LastModified -and ($cacheEntry.LastModified -eq $remoteMeta.LastModified)) {
+                        $metaMatches = $true
+                    }
+                }
+                
+                if ($metaMatches -and $cacheEntry.InstallerVersion -and $currentVersion -and
+                    (Compare-Version -CurrentVersion $currentVersion -TargetVersion $cacheEntry.InstallerVersion)) {
+                    Write-Host "[$currentUpdate/$updateCount] arm64 latest installer unchanged and current version ($currentVersion) >= cached ($($cacheEntry.InstallerVersion)) - Skipping download" -ForegroundColor Cyan
+                    break
+                }
+            }
+            
+            if (-not $url) {
+                Write-Host "  NOTE: Visual C++ $version requires manual download" -ForegroundColor Yellow
+                if ($vcInfo.DownloadPage) {
+                    Write-Host "  Please visit: $($vcInfo.DownloadPage)" -ForegroundColor Yellow
+                }
+                Write-Host "  Skipping automated update for this version." -ForegroundColor Yellow
+            }
+            else {
+                $installerPath = Join-Path $TempDir "vcredist_${version}_arm64.exe"
+                $downloadedFiles += $installerPath
+                
+                try {
+                    Write-Host "  Downloading..."
+                    $downloadResponse = Invoke-WebRequest -Uri $url -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
+                    Write-Host "  Download complete." -ForegroundColor Green
+                    
+                    if (Test-Path $installerPath) {
+                        # Check installer version for both EOL and non-EOL versions
+                        $installerVersion = Get-InstallerVersion -FilePath $installerPath
+                        $etag = $null
+                        $lastModified = $null
+                        if ($remoteMeta) {
+                            $etag = $remoteMeta.ETag
+                            $lastModified = $remoteMeta.LastModified
+                        }
+                        elseif ($downloadResponse -and $downloadResponse.Headers) {
+                            $etag = $downloadResponse.Headers.ETag
+                            $lastModified = $downloadResponse.Headers.'Last-Modified'
+                        }
+                        
+                        if (-not $vcInfo.IsEOL) {
+                            if (-not $redistCache.ContainsKey($version)) {
+                                $redistCache[$version] = @{}
+                            }
+                            $redistCache[$version]["arm64"] = @{
+                                ETag = $etag
+                                LastModified = $lastModified
+                                InstallerVersion = $installerVersion
+                            }
+                            Save-RedistCache -Cache $redistCache
+                        }
+                        
+                        if ($installerVersion) {
+                            Write-Host "  Downloaded installer version: $installerVersion" -ForegroundColor Gray
+                            
+                            if ($currentVersion -and (Compare-Version -CurrentVersion $currentVersion -TargetVersion $installerVersion)) {
+                                Write-Host "  Current version ($currentVersion) is already same or newer than installer ($installerVersion) - Skipping installation" -ForegroundColor Cyan
+                                break
+                            }
+                        }
+                        
+                        Write-Host "  Installing..."
+                        $silentArgs = $SilentArgsMap[$version]
+                        $Process = Start-Process -FilePath $installerPath -ArgumentList $silentArgs -Wait -PassThru -WindowStyle Hidden
+                        
+                        switch ($Process.ExitCode) {
+                            0 { 
+                                Write-Host "  Installation successful." -ForegroundColor Green
+                                
+                                # Verify what changed
+                                if ($vcInfo.IsEOL) {
+                                    Start-Sleep -Seconds 2
+                                    $newCheck = Test-VCInstalled -DisplayNamePattern $vcInfo.DisplayName -Architecture "arm64"
+                                    if ($newCheck.Installed -and $newCheck.Details.DisplayVersion) {
+                                        Write-Host "  Registry version after install: $($newCheck.Details.DisplayVersion)" -ForegroundColor Cyan
+                                    }
+                                    
+                                    # Check if KB is now detected
+                                    if ($vcInfo.KB -match "KB\d+") {
+                                        $kbCheck = Test-KBInstalled -KBNumber $vcInfo.KB
+                                        Write-Host "  $($vcInfo.KB) detected: $kbCheck" -ForegroundColor Cyan
+                                    }
+                                }
+                            }
+                            3010 { 
+                                Write-Host "  Installation successful. Reboot required." -ForegroundColor Yellow
+                                $RebootRequired = $true
+                            }
+                            default { 
+                                Write-Warning "  Exit code: $($Process.ExitCode) (may indicate already updated or minor issue)"
+                            }
+                        }
+                    }
+                }
+                catch {
+                    Write-Warning "  Failed: $_"
+                }
+            }
+            } while ($false)
             Write-Host ""
         }
     }
