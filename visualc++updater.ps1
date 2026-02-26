@@ -710,6 +710,7 @@ try {
                     Write-Warning "  Failed: $_"
                 }
             }
+            } while ($false)
             Write-Host ""
         }
         
