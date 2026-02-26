@@ -33,6 +33,16 @@ A comprehensive PowerShell script that automatically detects, downloads, and upd
 
 ## Usage
 
+### One-Liner (Run as Administrator)
+
+```powershell
+# Recommended: URL-safe filename (avoids encoding issues)
+powershell -ExecutionPolicy Bypass -Command "iex (Invoke-RestMethod 'https://raw.githubusercontent.com/monobrau/visualcplusplusupdater/main/visualcpp-updater.ps1')"
+
+# Alternative: direct script with URL-encoded filename
+powershell -ExecutionPolicy Bypass -Command "iex (Invoke-RestMethod 'https://raw.githubusercontent.com/monobrau/visualcplusplusupdater/main/visualc%2B%2Bupdater.ps1')"
+```
+
 ### Basic Usage
 
 1. **Download the script** to your preferred directory
